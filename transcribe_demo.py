@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import wave
 import os
 import speech_recognition as sr
 import whisper
@@ -12,6 +13,7 @@ from queue import Queue
 from tempfile import NamedTemporaryFile
 from time import sleep
 from sys import platform
+import threading
 
 
 def main():
@@ -27,6 +29,8 @@ def main():
     parser.add_argument("--phrase_timeout", default=3,
                         help="How much empty space between recordings before we "
                              "consider it a new line in the transcription.", type=float)
+    parser.add_argument("--output_file", default="out", help="output file base, will create two files: .wav and .txt")
+    
     if 'linux' in platform:
         parser.add_argument("--default_microphone", default='pulse',
                             help="Default microphone name for SpeechRecognition. "
@@ -84,6 +88,9 @@ def main():
         """
         # Grab the raw bytes and push it into the thread safe queue.
         data = audio.get_raw_data()
+        audio_data = sr.AudioData(data, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+        wav_data = audio_data.get_wav_data()
+        append_to_audio_file(args.output_file, wav_data)
         data_queue.put(data)
 
     # Create a background thread that will pass us raw audio bytes.
@@ -91,19 +98,30 @@ def main():
     recorder.listen_in_background(source, record_callback, phrase_time_limit=record_timeout)
 
     # Cue the user that we're ready to go.
-    print("Model loaded.\n")
+    print("Model loaded.\n listening...\n")
 
+    timer = None
     while True:
         try:
             now = datetime.utcnow()
             # Pull raw recorded audio from the queue.
             if not data_queue.empty():
                 phrase_complete = False
+                
+                # if we have a timer, cancel it
+                if (timer):
+                    timer.cancel()
+                    
+                # set a timer to append the last piece, in case there is silence after the last recording, the recorder would push to data_queue and we wouldn't output the last line eventough we know it is complete
+                timer = threading.Timer(phrase_timeout, lambda: append_to_transcription_file(args.output_file, transcription[-1]))
+                timer.start()
+                
                 # If enough time has passed between recordings, consider the phrase complete.
                 # Clear the current working audio buffer to start over with the new data.
                 if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
                     last_sample = bytes()
-                    phrase_complete = True
+                    phrase_complete = True 
+                    
                 # This is the last time we received new audio data from the queue.
                 phrase_time = now
 
@@ -121,8 +139,7 @@ def main():
                     f.write(wav_data.read())
 
                 # Read the transcription.
-                result = audio_model.transcribe(temp_file, fp16=torch.cuda.is_available())
-                text = result['text'].strip()
+                text = transcribe(audio_model, temp_file)
 
                 # If we detected a pause between recordings, add a new item to our transcription.
                 # Otherwise edit the existing one.
@@ -146,6 +163,38 @@ def main():
     print("\n\nTranscription:")
     for line in transcription:
         print(line)
+
+
+def transcribe(audio_model, audio_file):
+    result = audio_model.transcribe(audio_file, fp16=torch.cuda.is_available())
+    text = result['text'].strip() 
+    # if True:
+    #     from faster_whisper import WhisperModel
+    #     text = []
+    #     model = WhisperModel("small", device="cpu", compute_type="int8")
+    #     segments, info = model.transcribe(audio_file, beam_size=1)
+    #     for segment in segments:
+    #         text.append(segment.text)
+    #     text = "\n".join(text)
+    return text
+
+def append_to_audio_file(filename, bytes):
+    filename = filename + ".wav"
+    oldframes = None
+    if os.path.exists(filename):
+        with wave.open(filename, 'rb') as old:
+            oldframes = old.readframes(old.getnframes())
+        
+    with wave.open(filename, 'wb') as combined:
+        with wave.open(io.BytesIO(bytes), 'rb') as new:
+            combined.setparams(new.getparams())
+            if (oldframes):
+                combined.writeframes(oldframes)
+            combined.writeframes(new.readframes(new.getnframes()))
+                        
+def append_to_transcription_file(filename, text):
+    with open(filename + ".txt", 'a') as f:
+        f.write(text + "\n")
 
 
 if __name__ == "__main__":
